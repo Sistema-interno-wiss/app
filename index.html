@@ -1163,7 +1163,7 @@ async function loadColorOptionsFromSupabase(){
   DB.settings.colorOptions = (data||[]).map(r=>r.name);
 }
 async function commitColorOption(value){
-  value = (value||'').trim();
+  value = (value||'').trim().toUpperCase();
   if(!value) return;
   if(!DB.settings.colorOptions) DB.settings.colorOptions = [];
   const yaExiste = DB.settings.colorOptions.some(v=>v.toLowerCase()===value.toLowerCase());
@@ -2334,7 +2334,20 @@ views.pedidos = function(){
   if(!can('verOperacion')){
     return `<h1 class="page-title">Pedidos</h1><div class="page-sub">Tu usuario no tiene permiso para ver este módulo.</div>`;
   }
-  let list = [...DB.orders].sort((a,b)=> b.date.localeCompare(a.date));
+  // Se agrupan en dos bloques, en vez de revueltos por fecha como antes:
+  // arriba los Pendientes/Parciales (los que llevan MÁS tiempo esperando su
+  // pago primero, para que no se olviden), y abajo los Liquidados y
+  // Cancelados (los más recientes primero, ya no urgen).
+  const grupoOrden = (o)=>{
+    const s = orderStatus(o);
+    if(s === 'Liquidado' || s === 'Cancelado') return 1;
+    return 0;
+  };
+  let list = [...DB.orders].sort((a,b)=>{
+    const ga = grupoOrden(a), gb = grupoOrden(b);
+    if(ga !== gb) return ga - gb;
+    return ga === 0 ? a.date.localeCompare(b.date) : b.date.localeCompare(a.date);
+  });
   if(window._filterOrdersClient){
     list = list.filter(o=>o.clientId===window._filterOrdersClient);
   }
@@ -2374,11 +2387,13 @@ views.pedidos = function(){
     <table>
       <thead><tr><th>Folio</th><th>Cliente</th><th>Fecha</th><th>Pares</th><th>Total</th><th>Saldo</th><th>Estado</th><th></th></tr></thead>
       <tbody>
-      ${list.length ? list.map(o=>{
+      ${list.length ? list.map((o,i)=>{
         const total = orderTotal(o);
         const paid = orderPaid(o);
         const pieces = (o.items||[]).reduce((s,it)=>s+Number(it.qty||0),0);
-        return `<tr>
+        const divider = (i>0 && grupoOrden(list[i-1])===0 && grupoOrden(o)===1)
+          ? `<tr class="empty-row"><td colspan="8" style="text-align:left;font-weight:700;color:var(--ink-soft);background:var(--paper);">— Liquidados / cancelados —</td></tr>` : '';
+        return divider + `<tr>
           <td class="mono">${o.folio}${o.versions&&o.versions.length?` <span style="color:var(--ink-soft);font-size:11px;">v${o.versions.length+1}</span>`:''}</td>
           <td>${clientName(o.clientId)}</td>
           <td>${fdate(o.date)}</td>
@@ -2434,7 +2449,7 @@ function openOrderForm(existingId, duplicateFrom){
           <thead><tr>
             <th>Modelo</th><th>Color</th>
             ${window._draftGridSizes.map(s=>`<th>${escapeHtml(s)}</th>`).join('')}
-            <th>Pares</th><th>Precio<br>unitario</th><th>Desc. %</th><th>Subtotal</th><th></th>
+            <th>Pares</th><th>Precio<br>unitario</th><th>Desc. %</th><th>Subtotal</th><th>Devol./<br>Reposic.</th><th></th>
           </tr></thead>
           <tbody id="draftGridBody"></tbody>
         </table>
@@ -2486,7 +2501,7 @@ function updateDraftClientStatus(){
 function draftEmptyGridRow(sizes){
   const s = {};
   (sizes||window._draftGridSizes||SHOE_SIZES).forEach(sz=>s[sz]=0);
-  return { id: uid('drow'), modelText:'', modelId:'', color:'', sizes:s, price:0, itemDiscount:0, meta:{} };
+  return { id: uid('drow'), modelText:'', modelId:'', color:'', sizes:s, price:0, itemDiscount:0, meta:{}, returnFlag:false };
 }
 function draftGridRowsFromItems(items, sizes){
   const groups = {};
@@ -2513,6 +2528,7 @@ function draftGridRowsFromItems(items, sizes){
       if(it.promoLabel) meta.promoLabel = it.promoLabel;
       if(it.isReturn) meta.isReturn = it.isReturn;
       row.meta[sz] = meta;
+      if(it.isReturn) row.returnFlag = true;
     }
   });
   const rows = order.map(k=>groups[k]);
@@ -2594,6 +2610,22 @@ function draftGridSetDiscount(idx, val){
   window._draftGridRows[idx].itemDiscount = Math.max(0, Number(val)||0);
   updateDraftGridRowUI(idx);
 }
+// Igual que en el Cotizador: al marcar "Devolución/Reposición", el importe
+// se va a $0 (se repone sin costo) pero se puede escribir a mano si sí se
+// va a cobrar algo; al desmarcarla, regresa el precio que tenía antes.
+function draftGridToggleReturn(idx, checked){
+  const row = window._draftGridRows[idx];
+  row.returnFlag = checked;
+  if(checked){
+    row.priceBeforeReturn = row.price;
+    row.price = 0;
+    row.itemDiscount = 0;
+  } else if(row.priceBeforeReturn !== undefined){
+    row.price = row.priceBeforeReturn;
+    delete row.priceBeforeReturn;
+  }
+  renderDraftGrid();
+}
 function updateDraftGridRowUI(idx){
   const row = window._draftGridRows[idx];
   const t = draftRowTotals(row);
@@ -2609,7 +2641,7 @@ function renderDraftGrid(){
   const sizes = window._draftGridSizes;
   body.innerHTML = window._draftGridRows.map((row, idx)=>{
     const t = draftRowTotals(row, sizes);
-    return `<tr>
+    return `<tr class="${row.returnFlag?'qc-row-return':''}">
       <td class="qc-model-cell">
         <input class="qc-model-input" id="draftModelInput${idx}" value="${escapeAttr(row.modelText)}" placeholder="Escribe para buscar…" autocomplete="off"
           oninput="draftGridModelInput(${idx}, this.value)"
@@ -2624,9 +2656,10 @@ function renderDraftGrid(){
       </select></td>
       ${sizes.map(sz=>`<td><input class="qc-size-input" id="draftSizeInput${idx}_${sz}" type="number" min="0" value="${row.sizes[sz]||0}" onfocus="this.select()" oninput="draftGridSetSize(${idx}, '${sz}', this.value)"></td>`).join('')}
       <td class="qc-pares-cell" id="draftParesCell${idx}"><span class="qc-pares-num">${t.pares}</span></td>
-      <td><input class="qc-price-input" id="draftPriceInput${idx}" type="number" step="0.01" min="0" value="${row.price||''}" placeholder="—" oninput="draftGridSetPrice(${idx}, this.value)"></td>
-      <td><input class="qc-price-input" type="number" step="0.01" min="0" max="100" value="${row.itemDiscount||0}" style="width:58px;" oninput="draftGridSetDiscount(${idx}, this.value)"></td>
+      <td><input class="qc-price-input" id="draftPriceInput${idx}" type="number" step="0.01" min="0" value="${row.price===0&&row.returnFlag?'0':(row.price||'')}" placeholder="—" oninput="draftGridSetPrice(${idx}, this.value)"></td>
+      <td><input class="qc-price-input" type="number" step="0.01" min="0" max="100" value="${row.itemDiscount||0}" style="width:58px;" ${row.returnFlag?'disabled title="En una reposición no aplica descuento"':''} oninput="draftGridSetDiscount(${idx}, this.value)"></td>
       <td class="qc-subtotal-cell" id="draftSubCell${idx}">${money(t.subtotal)}</td>
+      <td style="text-align:center;"><input type="checkbox" ${row.returnFlag?'checked':''} onchange="draftGridToggleReturn(${idx}, this.checked)" title="Devolución o defectuoso: se repone el par sin costo (el importe se puede escribir a mano)"></td>
       <td>${window._draftGridRows.length>1 ? `<button class="btn ghost sm" onclick="removeDraftGridRow(${idx})">✕</button>` : ''}</td>
     </tr>`;
   }).join('');
@@ -2665,7 +2698,11 @@ async function saveOrder(existingId){
         qty: Number(row.sizes[sz]),
         price: Number(row.price)||0,
         itemDiscount: Number(row.itemDiscount)||0,
-        ...(row.meta && row.meta[sz] ? row.meta[sz] : {})
+        ...(row.meta && row.meta[sz] ? row.meta[sz] : {}),
+        // La casilla de Devolución/Reposición de AHORA siempre manda sobre
+        // lo que traía el renglón antes de abrir para editar — si no, marcar
+        // o desmarcar la casilla durante la edición no se hubiera guardado.
+        isReturn: !!row.returnFlag,
       });
     }
   }
@@ -2846,9 +2883,9 @@ function generateOrderPDF(id, showIVA, showPromos){
   const o = DB.orders.find(x=>x.id===id);
   if(!o || !window.jspdf){ showToast('El generador de PDF no cargó. Intenta de nuevo.'); return; }
   const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({ orientation:'landscape', unit:'mm', format:'a4' });
-  const PAGE_W = 297, PAGE_H = 210;    // horizontal: más espacio para modelos, colores y tallas
-  const M = 12;                    // margen izquierdo/derecho del contenido
+  const doc = new jsPDF({ orientation:'portrait', unit:'mm', format:'a4' });
+  const PAGE_W = 210, PAGE_H = 297;    // vertical: más fácil de imprimir/guardar tal cual
+  const M = 9;                     // margen izquierdo/derecho del contenido (más angosto que antes)
   const CELL_PAD = 2.6;            // aire interno de cada celda
   const ROW_H = 8.4;               // alto de renglón: espacioso y fácil de leer
   const HEAD_H = 14.6;             // encabezado más alto: ahora lleva ícono + etiqueta de 2 líneas
@@ -3122,7 +3159,7 @@ function generateOrderPDF(id, showIVA, showPromos){
     doc.text(fitText(doc, clientName(o.clientId), 1150*PXS-628*PXS-4*SCALE), BAND_X+628*PXS, valueY);
     doc.text(fitText(doc, fdate(o.date), 1483*PXS-1195*PXS-4*SCALE), BAND_X+1195*PXS, valueY);
 
-    return HEAD_H_MM + INFO_H_MM + 8; // Y donde empieza la tabla
+    return HEAD_H_MM + INFO_H_MM + 2; // Y donde empieza la tabla (espacio angosto, para caber más renglones por hoja)
   }
 
   /* ---------- encabezado corto (páginas siguientes) ---------- */
@@ -3192,7 +3229,7 @@ function generateOrderPDF(id, showIVA, showPromos){
   rows.forEach(({g, pares, importe})=>{
     if(y + ROW_H > BODY_BOTTOM){
       drawGrid(tableTop, y, rowYs);
-      doc.addPage('a4','landscape');
+      doc.addPage('a4','portrait');
       tableTop = drawContinuationHeader();
       y = drawTableHead(tableTop);
       zebra = 0;
@@ -3280,7 +3317,7 @@ function generateOrderPDF(id, showIVA, showPromos){
   const legendLines = doc.splitTextToSize(ORDER_CONFIRM_LEGEND, anchoUtil - 20);
   const bloqueAlto = CARDS_H_MM + 6 + (lineasExtra.length * 5.5) + 7 + (legendLines.length * 4.6) + 8 + FOOT_H_MM + 3;
   if(y + bloqueAlto > PAGE_H){
-    doc.addPage('a4','landscape');
+    doc.addPage('a4','portrait');
     y = drawContinuationHeader();
   }
 
@@ -3326,7 +3363,7 @@ function generateOrderPDF(id, showIVA, showPromos){
   doc.setFont('helvetica','normal');
   doc.setTextColor(INK[0],INK[1],INK[2]);
 
-  ty += CARDS_H_MM + 8;
+  ty += CARDS_H_MM + 3;
 
   // Desglose (IVA / envío) si aplica, y avisos de promoción/reposición.
   if(lineasExtra.length){
@@ -3366,10 +3403,10 @@ function generateOrderPDF(id, showIVA, showPromos){
   /* ---------- leyenda de confirmación ---------- */
   const legendH = legendLines.length * 4.6 + 8;
   doc.setFillColor(SOFT_PINK[0],SOFT_PINK[1],SOFT_PINK[2]);
-  doc.roundedRect(M, ty+4, anchoUtil, legendH, 3, 3, 'F');
+  doc.roundedRect(M, ty+1, anchoUtil, legendH, 3, 3, 'F');
   doc.setFont('helvetica','bolditalic'); doc.setFontSize(8.8);
   doc.setTextColor(ROSE_TEXT[0],ROSE_TEXT[1],ROSE_TEXT[2]);
-  doc.text(legendLines, M+6, ty+4+6);
+  doc.text(legendLines, M+6, ty+1+6);
 
   /* ---------- pie moderno (solo última página) ----------
      Ya no es una foto: es una ola con degradado hecha con vectores (rosa
@@ -4425,7 +4462,7 @@ function generateShipmentPDF(id){
 
   doc.setFontSize(9);
   doc.setTextColor(110,90,100);
-  const legend = 'Una vez entregado el paquete a la paqueteria seleccionada por el cliente, la responsabilidad del traslado corresponde a dicha empresa. Sandalias Wiss proporciona el numero de guia para su seguimiento; cualquier incidencia durante el transporte debera gestionarse directamente con la paqueteria correspondiente.';
+  const legend = 'Una vez entregado el paquete a la paquetería seleccionada por el cliente, la responsabilidad del traslado corresponde a dicha empresa. Sandalias Wiss proporciona el número de guía para su seguimiento; cualquier incidencia durante el transporte deberá gestionarse directamente con la paquetería correspondiente.';
   doc.text(legend, 14, y, {maxWidth:182});
 
   doc.save(`Embarque_${o?o.folio:s.id}.pdf`);
@@ -4577,7 +4614,7 @@ function truncLabel(s, max){
 function renderMiniLineChart(pairs, opts){
   opts = opts || {};
   const H = opts.height || 250;
-  const padL = 60, padB = 66, padT = 18, padR = 20;
+  const padL = 60, padB = 66, padT = 26, padR = 20;
   const n = pairs.length || 1;
   // Cada categoría necesita su propio espacio mínimo para que la etiqueta no
   // se encime con la de al lado. Si no caben todas en el ancho disponible,
@@ -4615,7 +4652,7 @@ function renderMiniLineChart(pairs, opts){
                 <line x1="${padL}" y1="${padT+chartH}" x2="${padL+chartW}" y2="${padT+chartH}" stroke="#7f7f7f" stroke-width="1.25"/>`;
   const svg = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" style="display:block;background:#fff;">${plotBg}${guides}${polyline}${markers}${axes}</svg>`;
   const needsScroll = W > containerW;
-  return `<div style="${needsScroll?'overflow-x:auto;':''}border:1px solid #d9d9d9;border-radius:4px;padding:6px 4px 2px;background:#fff;">${svg}</div>`;
+  return `<div style="${needsScroll?'overflow-x:auto;':''}border:1px solid #d9d9d9;border-radius:4px;padding:14px 4px 2px;background:#fff;">${svg}</div>`;
 }
 function renderMiniBarChart(pairs, opts){
   opts = opts || {};
@@ -5521,8 +5558,8 @@ function qcGridPickModel(idx, id, name, price){
   if(box) box.classList.remove('show');
   updateQcGridRowUI(idx);
 }
-const COMMON_COLORS = ['Negro','Blanco','Beige','Café','Camel','Rojo','Vino','Rosa','Nude','Dorado','Plateado','Azul','Verde','Multicolor'];
-const QC_QUICK_COLORS = ['Negro','Rojo','Azul','Blanco','Camel','Café','Oro','Plata','Tan'];
+const COMMON_COLORS = ['NEGRO','BLANCO','BEIGE','CAFÉ','CAMEL','ROJO','VINO','ROSA','NUDE','DORADO','PLATEADO','AZUL','VERDE','MULTICOLOR'];
+const QC_QUICK_COLORS = ['NEGRO','ROJO','AZUL','BLANCO','CAMEL','CAFÉ','ORO','PLATA','TAN'];
 async function qcGridColorSelect(selectEl, idx){
   if(selectEl.value === '__new__'){
     const entered = prompt('Escribe el nuevo color:');
