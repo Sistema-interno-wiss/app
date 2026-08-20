@@ -1251,7 +1251,7 @@ async function loadAll(){
   // "clients" ya no se lee de aquí: vive en la tabla real de Supabase y se
   // carga aparte, en loadClientsFromSupabase() — solo después de iniciar
   // sesión, porque antes de eso las reglas de seguridad no dejan ver nada.
-  const keys = ['logEntries','counters','settings'];
+  const keys = ['counters','settings'];
   const store = storageBackend();
   for(const k of keys){
     try{
@@ -1427,17 +1427,51 @@ async function updateOrderInSupabase(id, patchLocal){
   return true;
 }
 
-/* ================= BITÁCORA (trazabilidad) ================= */
+/* ================= BITÁCORA (trazabilidad) — conectada a Supabase ========
+   Antes esto se guardaba solo en el almacenamiento local de cada navegador
+   (por eso en una computadora distinta se veía "vacío" el historial, aunque
+   sí hubiera movimientos). Ahora vive en la tabla real "log_entries" de
+   Supabase, compartida entre todas las personas, igual que pedidos/pagos.
+============================================================================ */
+function logToSupabaseRow(l){
+  return {
+    user_name: l.user, at: l.at, action: l.action, entity: l.entity,
+    entity_label: l.entityLabel, before: l.before || '', after: l.after || '',
+  };
+}
+function supabaseRowToLog(row){
+  return {
+    id: row.id, user: row.user_name, at: row.at, action: row.action,
+    entity: row.entity, entityLabel: row.entity_label,
+    before: row.before || '', after: row.after || '',
+  };
+}
+async function loadLogEntriesFromSupabase(){
+  if(!sbClient){ return; }
+  const { data, error } = await sbClient.from('log_entries').select('*').order('at', { ascending: false }).limit(4000);
+  if(error){
+    console.error('Error cargando bitácora desde Supabase', error);
+    return; // no se interrumpe el arranque del sistema por esto
+  }
+  DB.logEntries = (data||[]).map(supabaseRowToLog);
+}
 async function logAction(action, entity, entityLabel, before, after){
-  DB.logEntries.push({
+  const entry = {
     id: uid('log'),
     user: (window.currentUser && window.currentUser.name) || 'Sin sesión',
     at: new Date().toISOString(),
     action, entity, entityLabel,
     before: before ? JSON.stringify(before) : '',
     after: after ? JSON.stringify(after) : ''
-  });
-  if(DB.logEntries.length > 4000) DB.logEntries = DB.logEntries.slice(-4000);
+  };
+  DB.logEntries.unshift(entry); // se ve reflejado de inmediato en pantalla
+  if(sbClient){
+    const { error } = await sbClient.from('log_entries').insert(logToSupabaseRow(entry));
+    if(error) console.error('Error guardando bitácora en Supabase', error);
+    return;
+  }
+  // Respaldo si no hay conexión a Supabase (ej. desarrollo local sin servidor).
+  if(DB.logEntries.length > 4000) DB.logEntries = DB.logEntries.slice(0, 4000);
   await save('logEntries');
 }
 // Traduce un renglón de bitácora a una frase legible de "qué cambió", campo
@@ -4194,12 +4228,14 @@ async function savePayment(editId){
   const nuevos = (inserted||[]).map(supabaseRowToPayment);
   DB.payments.push(...nuevos);
   await logAction(editId?'editar':'crear', 'pago', (o?o.folio:orderId) + ' · ' + nuevos.length + ' exhibición(es)', null, nuevos);
+  const embarqueCreado = await autoCreateShipmentIfLiquidado(orderId);
 
   window._payEditGroupIds = [];
   closeModal();
-  showToast(nuevos.length>1
+  showToast((nuevos.length>1
     ? `${nuevos.length} depósitos registrados (Pago 1 a Pago ${nuevos.length}).`
-    : (editId ? 'Pago actualizado.' : 'Pago registrado.'));
+    : (editId ? 'Pago actualizado.' : 'Pago registrado.'))
+    + (embarqueCreado ? ' Pedido liquidado: se creó su embarque automáticamente.' : ''));
   render();
 }
 
@@ -4228,6 +4264,42 @@ function paymentShippingInfo(orderId){
   const p = DB.payments.find(x=> x.orderId===orderId && (x.carrier || Number(x.shippingCost||0) > 0));
   if(!p) return null;
   return { carrier: p.carrier || '', shippingCost: Number(p.shippingCost || 0), paymentId: p.id };
+}
+// Automatización: en cuanto un pedido queda Liquidado (pagado por completo),
+// se crea de una vez su registro en Embarques — así el módulo deja de
+// depender de que alguien se acuerde de darle clic a "+ Registrar embarque".
+// Queda en estado "En preparación" y con la paquetería/costo que ya se haya
+// capturado en Pagos, si los hay; el responsable puede editarlo después
+// (agregar guía, cambiar estado, etc.) desde Embarques como siempre.
+// No se dispara si el pedido ya tenía un embarque (evita duplicados), y no
+// bloquea ni interrumpe el flujo de guardar el pago si algo falla.
+async function autoCreateShipmentIfLiquidado(orderId){
+  try{
+    const o = DB.orders.find(x=>x.id===orderId);
+    if(!o) return false;
+    if(orderStatus(o) !== 'Liquidado') return false;
+    if(DB.shipments.some(s=>s.orderId===orderId)) return false; // ya tiene uno, no se duplica
+    if(!sbClient) return false;
+    const payInfo = paymentShippingInfo(orderId);
+    const data = {
+      orderId, date: todayStr(),
+      carrier: payInfo ? payInfo.carrier : '',
+      trackingNumber: '',
+      shippingCost: payInfo ? payInfo.shippingCost : 0,
+      status: 'En preparación',
+      responsible: (window.currentUser && window.currentUser.name) || '',
+    };
+    const row = shipmentToSupabaseRow(data);
+    const { data: inserted, error } = await sbClient.from('shipments').insert(row).select().single();
+    if(error){ console.error('Error creando embarque automático', error); return false; }
+    const shp = supabaseRowToShipment(inserted);
+    DB.shipments.push(shp);
+    await logAction('crear', 'embarque', o.folio + ' (automático al liquidarse)', null, shp);
+    return true;
+  }catch(e){
+    console.error('Error en autoCreateShipmentIfLiquidado', e);
+    return false;
+  }
 }
 
 /* ================= EMBARQUES ================= */
@@ -4614,13 +4686,13 @@ function truncLabel(s, max){
 function renderMiniLineChart(pairs, opts){
   opts = opts || {};
   const H = opts.height || 250;
-  const padL = 60, padB = 66, padT = 26, padR = 20;
+  const padL = 60, padB = 70, padT = 26, padR = 20;
   const n = pairs.length || 1;
   // Cada categoría necesita su propio espacio mínimo para que la etiqueta no
   // se encime con la de al lado. Si no caben todas en el ancho disponible,
   // la gráfica se hace más ancha que su contenedor y se puede desplazar de
   // lado (en vez de apretar el texto hasta volverlo ilegible).
-  const minPerCat = opts.minPerCat || 58;
+  const minPerCat = opts.minPerCat || 64;
   const containerW = opts.width || 760;
   const neededChartW = Math.max(containerW - padL - padR, (n-1)*minPerCat);
   const W = padL + neededChartW + padR;
@@ -4642,16 +4714,26 @@ function renderMiniLineChart(pairs, opts){
             <text x="${padL-8}" y="${(y+3).toFixed(1)}" text-anchor="end" font-size="10" fill="var(--ink-soft)">${escapeHtml(fmt(niceMax*f))}</text>`;
   }).join('');
   const polyline = `<polyline points="${pts.map(p=>p.x.toFixed(1)+','+p.y.toFixed(1)).join(' ')}" fill="none" stroke="var(--brass)" stroke-width="2.25"/>`;
+  // Las etiquetas se recortan solo lo necesario según el espacio real entre
+  // categorías (antes se recortaban siempre igual, sin importar si sobraba
+  // espacio) — el texto completo siempre está disponible al pasar el mouse.
+  const labelMaxChars = Math.max(10, Math.min(24, Math.round(minPerCat/4.2)));
   const markers = pts.map(p=>`
     <circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="3.5" fill="#fff" stroke="var(--brass)" stroke-width="2">
       <title>${escapeAttr(p.label)}: ${escapeAttr(fmt(p.val))}</title>
     </circle>
-    <text x="${p.x.toFixed(1)}" y="${(H-padB+16).toFixed(1)}" text-anchor="end" font-size="10" fill="var(--ink-soft)" transform="rotate(-40 ${p.x.toFixed(1)} ${(H-padB+16).toFixed(1)})">${escapeHtml(truncLabel(p.label,16))}<title>${escapeAttr(p.label)}</title></text>
+    <text x="${p.x.toFixed(1)}" y="${(H-padB+18).toFixed(1)}" text-anchor="end" font-size="10.5" fill="var(--ink-soft)" transform="rotate(-38 ${p.x.toFixed(1)} ${(H-padB+18).toFixed(1)})">${escapeHtml(truncLabel(p.label,labelMaxChars))}<title>${escapeAttr(p.label)}</title></text>
   `).join('');
   const axes = `<line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT+chartH}" stroke="#7f7f7f" stroke-width="1.25"/>
                 <line x1="${padL}" y1="${padT+chartH}" x2="${padL+chartW}" y2="${padT+chartH}" stroke="#7f7f7f" stroke-width="1.25"/>`;
-  const svg = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" style="display:block;background:#fff;">${plotBg}${guides}${polyline}${markers}${axes}</svg>`;
+  // Si todo cabe en el ancho de la tarjeta, la gráfica se estira a 100% del
+  // contenedor (evita el espacio en blanco a la derecha que se veía antes).
+  // Si hacen falta más categorías de las que caben, se mantiene el tamaño
+  // real en píxeles y aparece una barra de desplazamiento horizontal — así
+  // el texto nunca se aprieta hasta volverse ilegible.
   const needsScroll = W > containerW;
+  const svgAttrs = needsScroll ? `width="${W}" height="${H}"` : `width="100%" style="max-width:100%;height:auto;"`;
+  const svg = `<svg viewBox="0 0 ${W} ${H}" ${svgAttrs}>${plotBg}${guides}${polyline}${markers}${axes}</svg>`;
   return `<div style="${needsScroll?'overflow-x:auto;':''}border:1px solid #d9d9d9;border-radius:4px;padding:14px 4px 2px;background:#fff;">${svg}</div>`;
 }
 function renderMiniBarChart(pairs, opts){
@@ -6260,6 +6342,7 @@ async function loadCurrentUserProfile(authUser){
     loadPaymentsFromSupabase(),
     loadBankAccountsFromSupabase(),
     loadShipmentsFromSupabase(),
+    loadLogEntriesFromSupabase(),
   ]);
   // El Historial de venta (la Macro, +2,300 registros) NO se carga aquí —
   // solo se trae la primera vez que alguien realmente entra a esa pestaña
@@ -6280,13 +6363,29 @@ async function loadCurrentUserProfile(authUser){
   render();
 }
 async function logout(){
-  if(sbClient) await sbClient.auth.signOut();
-  window.currentUser = null;
-  location.reload();
+  // Se protege con un límite de tiempo: si Supabase no responde (internet
+  // lento, servidor caído, etc.) la sesión igual se cierra del lado del
+  // navegador después de 4 segundos, en vez de quedarse esperando para
+  // siempre y dar la impresión de que "no deja cerrar sesión".
+  const footer = document.querySelector('.sidebar-footer a[onclick*="logout"]');
+  if(footer) footer.textContent = 'Cerrando sesión…';
+  try{
+    if(sbClient){
+      await Promise.race([
+        sbClient.auth.signOut(),
+        new Promise(resolve => setTimeout(resolve, 4000))
+      ]);
+    }
+  } catch(e){
+    console.error('Error al cerrar sesión en el servidor:', e);
+  } finally{
+    window.currentUser = null;
+    location.reload();
+  }
 }
 function resetInactivityTimer(){
   clearTimeout(inactivityTimer);
-  inactivityTimer = setTimeout(()=>{ showToast('Sesión cerrada por inactividad.'); setTimeout(logout, 1200); }, 20*60*1000); // 20 minutos
+  inactivityTimer = setTimeout(()=>{ showToast('Sesión cerrada por inactividad.'); setTimeout(logout, 1200); }, 35*60*1000); // 35 minutos
 }
 ['click','keydown','mousemove'].forEach(evt=>document.addEventListener(evt, ()=>{ if(window.currentUser) resetInactivityTimer(); }));
 
