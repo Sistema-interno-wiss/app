@@ -4686,17 +4686,27 @@ function truncLabel(s, max){
 function renderMiniLineChart(pairs, opts){
   opts = opts || {};
   const H = opts.height || 250;
-  // padL se agrandó un poco: con la etiqueta rotada en diagonal, la primera
-  // categoría (la más pegada al borde izquierdo) necesita margen extra para
-  // no salirse del área visible y recortarse contra el borde de la tarjeta
-  // — sobre todo notorio cuando solo hay un punto de datos.
-  const padL = 74, padB = 70, padT = 26, padR = 26;
   const n = pairs.length || 1;
   // Cada categoría necesita su propio espacio mínimo para que la etiqueta no
   // se encime con la de al lado. Si no caben todas en el ancho disponible,
   // la gráfica se hace más ancha que su contenedor y se puede desplazar de
   // lado (en vez de apretar el texto hasta volverlo ilegible).
   const minPerCat = opts.minPerCat || 64;
+  // Las etiquetas se recortan solo lo necesario según el espacio real entre
+  // categorías (antes se recortaban siempre igual, sin importar si sobraba
+  // espacio) — el texto completo siempre está disponible al pasar el mouse.
+  const labelMaxChars = Math.max(10, Math.min(24, Math.round(minPerCat/4.2)));
+  const LABEL_ROTATION = 38; // grados
+  const LABEL_FONT_SIZE = 10.5;
+  // La primera categoría queda pegada al borde izquierdo, y su etiqueta va
+  // rotada en diagonal — antes el margen izquierdo era un número fijo
+  // adivinado y se quedaba corto (la etiqueta se salía del recuadro blanco
+  // hacia la izquierda). Ahora se calcula el ancho real que puede ocupar esa
+  // etiqueta en diagonal y se usa como margen mínimo, para que siempre quepa
+  // sin importar cuántos caracteres tenga.
+  const CHAR_W = LABEL_FONT_SIZE * 0.62; // ancho aproximado por carácter
+  const labelOverhang = Math.ceil(labelMaxChars * CHAR_W * Math.cos(LABEL_ROTATION * Math.PI/180));
+  const padL = Math.max(60, 26 + labelOverhang), padB = 70, padT = 26, padR = 26;
   const containerW = opts.width || 760;
   const neededChartW = Math.max(containerW - padL - padR, (n-1)*minPerCat);
   const W = padL + neededChartW + padR;
@@ -4718,15 +4728,11 @@ function renderMiniLineChart(pairs, opts){
             <text x="${padL-8}" y="${(y+3).toFixed(1)}" text-anchor="end" font-size="10" fill="var(--ink-soft)">${escapeHtml(fmt(niceMax*f))}</text>`;
   }).join('');
   const polyline = `<polyline points="${pts.map(p=>p.x.toFixed(1)+','+p.y.toFixed(1)).join(' ')}" fill="none" stroke="var(--brass)" stroke-width="2.25"/>`;
-  // Las etiquetas se recortan solo lo necesario según el espacio real entre
-  // categorías (antes se recortaban siempre igual, sin importar si sobraba
-  // espacio) — el texto completo siempre está disponible al pasar el mouse.
-  const labelMaxChars = Math.max(10, Math.min(24, Math.round(minPerCat/4.2)));
   const markers = pts.map(p=>`
     <circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="3.5" fill="#fff" stroke="var(--brass)" stroke-width="2">
       <title>${escapeAttr(p.label)}: ${escapeAttr(fmt(p.val))}</title>
     </circle>
-    <text x="${p.x.toFixed(1)}" y="${(H-padB+18).toFixed(1)}" text-anchor="end" font-size="10.5" fill="var(--ink-soft)" transform="rotate(-38 ${p.x.toFixed(1)} ${(H-padB+18).toFixed(1)})">${escapeHtml(truncLabel(p.label,labelMaxChars))}<title>${escapeAttr(p.label)}</title></text>
+    <text x="${p.x.toFixed(1)}" y="${(H-padB+18).toFixed(1)}" text-anchor="end" font-size="${LABEL_FONT_SIZE}" fill="var(--ink-soft)" transform="rotate(-${LABEL_ROTATION} ${p.x.toFixed(1)} ${(H-padB+18).toFixed(1)})">${escapeHtml(truncLabel(p.label,labelMaxChars))}<title>${escapeAttr(p.label)}</title></text>
   `).join('');
   const axes = `<line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT+chartH}" stroke="#7f7f7f" stroke-width="1.25"/>
                 <line x1="${padL}" y1="${padT+chartH}" x2="${padL+chartW}" y2="${padT+chartH}" stroke="#7f7f7f" stroke-width="1.25"/>`;
@@ -4736,9 +4742,10 @@ function renderMiniLineChart(pairs, opts){
   // real en píxeles y aparece una barra de desplazamiento horizontal — así
   // el texto nunca se aprieta hasta volverse ilegible.
   const needsScroll = W > containerW;
-  // "overflow:visible" es un respaldo: aunque el margen ya se calculó para
-  // que las etiquetas quepan, si algún texto es más largo de lo previsto,
-  // se alcanza a ver saliéndose un poco en vez de cortarse de golpe.
+  // "overflow:visible" es un respaldo (no la solución principal): aunque el
+  // margen ya se calculó para que las etiquetas quepan, si algún texto es
+  // más largo de lo previsto, se alcanza a ver saliéndose un poco en vez de
+  // cortarse de golpe.
   const svgAttrs = needsScroll ? `width="${W}" height="${H}" style="overflow:visible;"` : `width="100%" style="max-width:100%;height:auto;overflow:visible;"`;
   const svg = `<svg viewBox="0 0 ${W} ${H}" ${svgAttrs}>${plotBg}${guides}${polyline}${markers}${axes}</svg>`;
   return `<div style="${needsScroll?'overflow-x:auto;':''}border:1px solid #d9d9d9;border-radius:4px;padding:14px 4px 2px;background:#fff;">${svg}</div>`;
