@@ -4686,7 +4686,11 @@ function truncLabel(s, max){
 function renderMiniLineChart(pairs, opts){
   opts = opts || {};
   const H = opts.height || 250;
-  const padL = 60, padB = 70, padT = 26, padR = 20;
+  // padL se agrandó un poco: con la etiqueta rotada en diagonal, la primera
+  // categoría (la más pegada al borde izquierdo) necesita margen extra para
+  // no salirse del área visible y recortarse contra el borde de la tarjeta
+  // — sobre todo notorio cuando solo hay un punto de datos.
+  const padL = 74, padB = 70, padT = 26, padR = 26;
   const n = pairs.length || 1;
   // Cada categoría necesita su propio espacio mínimo para que la etiqueta no
   // se encime con la de al lado. Si no caben todas en el ancho disponible,
@@ -4732,7 +4736,10 @@ function renderMiniLineChart(pairs, opts){
   // real en píxeles y aparece una barra de desplazamiento horizontal — así
   // el texto nunca se aprieta hasta volverse ilegible.
   const needsScroll = W > containerW;
-  const svgAttrs = needsScroll ? `width="${W}" height="${H}"` : `width="100%" style="max-width:100%;height:auto;"`;
+  // "overflow:visible" es un respaldo: aunque el margen ya se calculó para
+  // que las etiquetas quepan, si algún texto es más largo de lo previsto,
+  // se alcanza a ver saliéndose un poco en vez de cortarse de golpe.
+  const svgAttrs = needsScroll ? `width="${W}" height="${H}" style="overflow:visible;"` : `width="100%" style="max-width:100%;height:auto;overflow:visible;"`;
   const svg = `<svg viewBox="0 0 ${W} ${H}" ${svgAttrs}>${plotBg}${guides}${polyline}${markers}${axes}</svg>`;
   return `<div style="${needsScroll?'overflow-x:auto;':''}border:1px solid #d9d9d9;border-radius:4px;padding:14px 4px 2px;background:#fff;">${svg}</div>`;
 }
