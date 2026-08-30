@@ -36,7 +36,12 @@
 
   /* ---- shell ---- */
   .shell{display:grid;grid-template-columns:230px 1fr;min-height:100vh;}
-  .sidebar{background:var(--pine);color:#eef0e8;padding:22px 16px;display:flex;flex-direction:column;gap:4px;}
+  /* El menú lateral queda fijo en la ventana (no se desplaza con el
+     contenido de la derecha) — así "Cerrar sesión", hasta abajo del todo,
+     siempre está a la vista sin tener que bajar por páginas largas como
+     Reportes. Si el propio menú es más alto que la pantalla (poco común),
+     se desplaza solo, de forma independiente al contenido. */
+  .sidebar{position:sticky;top:0;height:100vh;overflow-y:auto;background:var(--pine);color:#eef0e8;padding:22px 16px;display:flex;flex-direction:column;gap:4px;}
   .brand{padding:0 8px 20px 8px;border-bottom:1px solid rgba(255,255,255,0.14);margin-bottom:16px;display:flex;align-items:center;gap:10px;}
   .brand-mark{width:38px;height:38px;flex:none;border-radius:50%;background:linear-gradient(145deg,var(--brass),var(--pine));display:flex;align-items:center;justify-content:center;font-family:'Fraunces',serif;font-weight:700;font-size:16px;color:#fff;box-shadow:0 2px 6px rgba(0,0,0,.25);}
   .brand .name{font-family:'Fraunces',serif;font-size:19px;font-weight:600;letter-spacing:0.5px;line-height:1.15;}
@@ -271,7 +276,7 @@
 
   @media (max-width:900px){
     .shell{grid-template-columns:1fr;}
-    .sidebar{flex-direction:row;overflow:auto;padding:12px;}
+    .sidebar{position:static;height:auto;overflow-y:visible;flex-direction:row;overflow:auto;padding:12px;}
     .cards{grid-template-columns:repeat(2,1fr);}
     .field-grid{grid-template-columns:1fr;}
   }
@@ -1149,19 +1154,34 @@ function computeNextClientCode(){ return computeNextWsNumber(); }
 // tienen código todavía — backfillClientCodes() se lo asigna una sola vez,
 // automáticamente, la primera vez que alguien entra al sistema después de
 // esta actualización (ver llamada junto a loadClientsFromSupabase).
+// Los códigos se calculan TODOS de una vez en memoria y se mandan en
+// paralelo (antes se mandaban uno por uno, en fila, esperando cada
+// respuesta del servidor antes de pasar al siguiente — con muchos clientes
+// pendientes eso hacía lenta la entrada al sistema cada vez).
 async function backfillClientCodes(){
   if(!sbClient) return;
   const sinCodigo = DB.clients.filter(c=>!c.code);
   if(!sinCodigo.length) return;
-  for(const c of sinCodigo){
-    let asignado = false;
-    for(let intento=0; intento<5 && !asignado; intento++){
-      const code = 'WS-' + computeNextClientCode();
-      const { data, error } = await sbClient.from('clients').update({ code }).eq('id', c.id).select().single();
-      if(!error){ c.code = data.code; asignado = true; }
-      else if(error.code === '23505'){ await Promise.all([loadClientsFromSupabase(), loadOrdersFromSupabase()]); }
-      else { console.error('Error asignando código a cliente existente', error); break; }
+  let next = computeNextWsNumber();
+  const updates = sinCodigo.map(c => ({ id: c.id, code: 'WS-' + (next++) }));
+  const results = await Promise.all(updates.map(u =>
+    sbClient.from('clients').update({ code: u.code }).eq('id', u.id).select().single()
+  ));
+  let errorRepetido = null;
+  results.forEach((r, i) => {
+    if(!r.error){
+      const c = DB.clients.find(x=>x.id===updates[i].id);
+      if(c) c.code = r.data.code;
+    } else {
+      errorRepetido = r.error;
     }
+  });
+  if(errorRepetido){
+    // Lo más probable es que aún falte correr en Supabase el SQL que agrega
+    // la columna "code" a la tabla clients. No se reintenta agresivamente
+    // aquí para no volver a tardar en el siguiente inicio de sesión — en
+    // cuanto la columna exista, esto se resuelve solo la próxima vez.
+    console.error('No se pudieron asignar todos los códigos de cliente (¿falta la columna "code" en Supabase?)', errorRepetido);
   }
 }
 // Trae el directorio completo de clientes desde Supabase. Solo funciona con
