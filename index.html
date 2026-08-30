@@ -1125,6 +1125,7 @@ const CLIENT_DIRECTORY_SEED = [
 // cambiar nada más.
 function clientToSupabaseRow(c){
   return {
+    code: c.code || null,
     name: c.name, contact: c.contact||'', phone: c.phone||'', email: c.email||'',
     rfc: c.rfc||'', cp: c.zip||'', address: c.address||'', colonia: c.colony||'',
     city: c.city||'', state: c.state||'', region: c.region||'', carrier: c.carrier||'',
@@ -1133,11 +1134,35 @@ function clientToSupabaseRow(c){
 }
 function supabaseRowToClient(row){
   return {
-    id: row.id, name: row.name, contact: row.contact||'', phone: row.phone||'',
+    id: row.id, code: row.code||'', name: row.name, contact: row.contact||'', phone: row.phone||'',
     email: row.email||'', rfc: row.rfc||'', zip: row.cp||'', address: row.address||'',
     colony: row.colonia||'', city: row.city||'', state: row.state||'', region: row.region||'',
     carrier: row.carrier||'', notes: row.notes||'', active: row.active !== false,
   };
+}
+// El código de clientes usa la misma numeración consecutiva que el folio de
+// pedidos (ver computeNextWsNumber) — un cliente y un pedido nunca terminan
+// con el mismo número.
+function computeNextClientCode(){ return computeNextWsNumber(); }
+// A cada cliente nuevo se le asigna su código en el momento de crearlo (ver
+// saveClient). Los clientes que ya existían de antes de este cambio no
+// tienen código todavía — backfillClientCodes() se lo asigna una sola vez,
+// automáticamente, la primera vez que alguien entra al sistema después de
+// esta actualización (ver llamada junto a loadClientsFromSupabase).
+async function backfillClientCodes(){
+  if(!sbClient) return;
+  const sinCodigo = DB.clients.filter(c=>!c.code);
+  if(!sinCodigo.length) return;
+  for(const c of sinCodigo){
+    let asignado = false;
+    for(let intento=0; intento<5 && !asignado; intento++){
+      const code = 'WS-' + computeNextClientCode();
+      const { data, error } = await sbClient.from('clients').update({ code }).eq('id', c.id).select().single();
+      if(!error){ c.code = data.code; asignado = true; }
+      else if(error.code === '23505'){ await Promise.all([loadClientsFromSupabase(), loadOrdersFromSupabase()]); }
+      else { console.error('Error asignando código a cliente existente', error); break; }
+    }
+  }
 }
 // Trae el directorio completo de clientes desde Supabase. Solo funciona con
 // sesión iniciada (antes de eso, las reglas de seguridad devuelven 0 filas a
@@ -1216,7 +1241,7 @@ async function loadBankAccountsFromSupabase(){
 // no hace nada.
 async function seedClientsIfEmpty(){
   if(!sbClient || DB.clients.length > 0 || !CLIENT_DIRECTORY_SEED.length) return;
-  const rows = CLIENT_DIRECTORY_SEED.map(c => clientToSupabaseRow({ active:true, contact:'', ...c }));
+  const rows = CLIENT_DIRECTORY_SEED.map((c,i) => clientToSupabaseRow({ active:true, contact:'', code:'WS-'+(1001+i), ...c }));
   const { data, error } = await sbClient.from('clients').insert(rows).select();
   if(error){ console.error('Error poblando el directorio inicial de clientes', error); return; }
   DB.clients = (data||[]).map(supabaseRowToClient);
@@ -1322,23 +1347,33 @@ async function loadPaymentsFromSupabase(){
   }
   DB.payments = (data||[]).map(supabaseRowToPayment);
 }
-// Antes, el número de folio se sacaba de un contador guardado en cada
-// computadora (DB.counters.orderFolio) — eso funcionaba porque cada
-// computadora tenía su propia lista de pedidos, separada. Ahora que los
-// pedidos son compartidos de verdad entre las 6 personas, ese contador local
-// ya no sirve: dos computadoras podrían generar el mismo folio al mismo
-// tiempo. En su lugar, el folio se calcula a partir del máximo folio que
-// existe ahora mismo en Supabase, y si por mala suerte dos personas
-// capturan un pedido en el mismo instante, el sistema detecta el choque
-// (folio repetido) y reintenta solo, sin que la persona note nada.
-function computeNextFolio(){
+// El folio (pedidos) y el código (clientes) comparten UNA sola numeración
+// consecutiva con el mismo prefijo "WS-" — por eso este cálculo revisa
+// AMBAS listas juntas: así un pedido y un cliente nunca terminan con el
+// mismo número, aunque se hayan creado en momentos distintos.
+function computeNextWsNumber(){
   let max = 1000;
   DB.orders.forEach(o=>{
     const m = /^WS-(\d+)$/.exec(o.folio||'');
     if(m){ const n = Number(m[1]); if(n>max) max = n; }
   });
+  DB.clients.forEach(c=>{
+    const m = /^WS-(\d+)$/.exec(c.code||'');
+    if(m){ const n = Number(m[1]); if(n>max) max = n; }
+  });
   return max + 1;
 }
+// Antes, el número de folio se sacaba de un contador guardado en cada
+// computadora (DB.counters.orderFolio) — eso funcionaba porque cada
+// computadora tenía su propia lista de pedidos, separada. Ahora que los
+// pedidos son compartidos de verdad entre las 6 personas, ese contador local
+// ya no sirve: dos computadoras podrían generar el mismo folio al mismo
+// tiempo. En su lugar, el folio se calcula a partir del máximo folio (o
+// código de cliente) que existe ahora mismo en Supabase, y si por mala
+// suerte dos personas capturan un pedido o cliente en el mismo instante, el
+// sistema detecta el choque (número repetido) y reintenta solo, sin que la
+// persona note nada.
+function computeNextFolio(){ return computeNextWsNumber(); }
 function orderToSupabaseRow(o){
   return {
     folio: o.folio, client_id: o.clientId || null, date: o.date,
@@ -1407,10 +1442,10 @@ async function insertOrderToSupabase(orderData){
       showToast('No se pudo guardar el pedido: ' + error.message);
       return null;
     }
-    // Folio duplicado: alguien más lo tomó justo antes — se recarga la lista
-    // real y se calcula un folio nuevo, sin que la persona tenga que hacer
-    // nada.
-    await loadOrdersFromSupabase();
+    // Folio duplicado: alguien más lo tomó justo antes (como pedido o como
+    // cliente, ya que comparten numeración) — se recarga todo y se calcula
+    // un folio nuevo, sin que la persona tenga que hacer nada.
+    await Promise.all([loadOrdersFromSupabase(), loadClientsFromSupabase()]);
   }
   showToast('No se pudo generar un folio único después de varios intentos. Intenta de nuevo.');
   return null;
@@ -1964,7 +1999,7 @@ async function toggleClientActive(id){
     if(error) console.error('Error cambiando estado del cliente', error);
   }
   if(ok) c.active = nuevoActivo;
-  await logAction(c.active?'reactivar':'desactivar', 'cliente', c.name, before, c);
+  await logAction(c.active?'reactivar':'desactivar', 'cliente', c.code || c.name, before, c);
   // Se cambia el filtro a "Todos" para que el cambio de estado quede a la vista
   // en la misma pantalla, en vez de que el renglón simplemente desaparezca.
   if(window._clientEstado !== 'todos') window._clientEstado = 'todos';
@@ -1998,7 +2033,7 @@ async function deleteClient(id){
     return;
   }
   DB.clients = DB.clients.filter(x=>x.id!==id);
-  await logAction('eliminar', 'cliente', c.name, before, null);
+  await logAction('eliminar', 'cliente', c.code || c.name, before, null);
   if(window._clientSelectedId === id) window._clientSelectedId = '';
   showToast('Cliente eliminado.');
   render();
@@ -2030,14 +2065,20 @@ async function saveClient(id){
     const { data: updated, error } = await sbClient.from('clients').update(row).eq('id', id).select().single();
     if(error){ showToast('No se pudo guardar el cliente: ' + error.message); return; }
     Object.assign(c, supabaseRowToClient(updated));
-    await logAction('editar', 'cliente', c.name, before, c);
+    await logAction('editar', 'cliente', c.code || c.name, before, c);
   } else {
-    const row = clientToSupabaseRow({ ...data, active: true });
-    const { data: inserted, error } = await sbClient.from('clients').insert(row).select().single();
-    if(error){ showToast('No se pudo crear el cliente: ' + error.message); return; }
-    const c = supabaseRowToClient(inserted);
+    let c = null;
+    for(let intento=0; intento<5 && !c; intento++){
+      const code = 'WS-' + computeNextClientCode();
+      const row = clientToSupabaseRow({ ...data, code, active: true });
+      const { data: inserted, error } = await sbClient.from('clients').insert(row).select().single();
+      if(!error){ c = supabaseRowToClient(inserted); }
+      else if(error.code === '23505'){ await Promise.all([loadClientsFromSupabase(), loadOrdersFromSupabase()]); }
+      else { showToast('No se pudo crear el cliente: ' + error.message); return; }
+    }
+    if(!c){ showToast('No se pudo generar un código único para el cliente. Intenta de nuevo.'); return; }
     DB.clients.push(c);
-    await logAction('crear', 'cliente', c.name, null, c);
+    await logAction('crear', 'cliente', c.code, null, c);
   }
   closeModal();
   showToast('Cliente guardado.');
@@ -5913,12 +5954,18 @@ async function resolveOrCreateClientByName(name){
   const existing = DB.clients.find(c=>c.name.trim().toLowerCase()===name.toLowerCase());
   if(existing) return { id: existing.id, created:false };
   if(!sbClient) return null;
-  const row = clientToSupabaseRow({ name, active:true, notes:'Creado automáticamente al importar desde Excel.' });
-  const { data: inserted, error } = await sbClient.from('clients').insert(row).select().single();
-  if(error){ console.error('Error creando cliente al importar', error); return null; }
-  const c = supabaseRowToClient(inserted);
+  let c = null;
+  for(let intento=0; intento<5 && !c; intento++){
+    const code = 'WS-' + computeNextClientCode();
+    const row = clientToSupabaseRow({ name, code, active:true, notes:'Creado automáticamente al importar desde Excel.' });
+    const { data: inserted, error } = await sbClient.from('clients').insert(row).select().single();
+    if(!error){ c = supabaseRowToClient(inserted); }
+    else if(error.code === '23505'){ await Promise.all([loadClientsFromSupabase(), loadOrdersFromSupabase()]); }
+    else { console.error('Error creando cliente al importar', error); return null; }
+  }
+  if(!c) return null;
   DB.clients.push(c);
-  await logAction('crear', 'cliente', name, null, c);
+  await logAction('crear', 'cliente', c.code, null, c);
   return { id: c.id, created:true };
 }
 async function handleImportFile(input){
@@ -6349,7 +6396,7 @@ async function loadCurrentUserProfile(authUser){
   // Se pide todo al mismo tiempo (en paralelo) en vez de uno por uno en fila
   // — así el tiempo de espera es el de lo más lento, no la suma de todo.
   await Promise.all([
-    (async()=>{ await loadClientsFromSupabase(); await seedClientsIfEmpty(); })(),
+    (async()=>{ await loadClientsFromSupabase(); await seedClientsIfEmpty(); await backfillClientCodes(); })(),
     (async()=>{ await loadModelsFromSupabase(); await seedModelsIfEmpty(); })(),
     loadColorOptionsFromSupabase(),
     loadOrdersFromSupabase(),
@@ -6397,8 +6444,17 @@ async function logout(){
     location.reload();
   }
 }
+// Usuarios que nunca deben cerrarse por inactividad (a petición explícita).
+// Se compara por nombre normalizado (sin mayúsculas/acentos ni espacios de
+// más) para que funcione aunque el nombre se capture con ligeras variantes.
+const NEVER_TIMEOUT_USERS = ['claudia mancilla'];
+function normalizeName(s){
+  return String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim().toLowerCase();
+}
 function resetInactivityTimer(){
   clearTimeout(inactivityTimer);
+  const isExempt = window.currentUser && NEVER_TIMEOUT_USERS.includes(normalizeName(window.currentUser.name));
+  if(isExempt) return; // esta persona nunca se desconecta por inactividad
   inactivityTimer = setTimeout(()=>{ showToast('Sesión cerrada por inactividad.'); setTimeout(logout, 1200); }, 35*60*1000); // 35 minutos
 }
 ['click','keydown','mousemove'].forEach(evt=>document.addEventListener(evt, ()=>{ if(window.currentUser) resetInactivityTimer(); }));
