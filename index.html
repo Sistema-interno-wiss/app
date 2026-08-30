@@ -6566,7 +6566,10 @@ views.administracion = function(){
       <div id="resetPassMsg" style="font-size:12.5px;margin-bottom:8px;"></div>
       <div class="field-grid">
         <div class="field"><label>Correo de la persona</label>
-          <input id="resetPassEmail" type="email" placeholder="correo@ejemplo.com" autocomplete="off">
+          <input id="resetPassEmail" type="email" list="resetPassEmailList" placeholder="correo@ejemplo.com" autocomplete="off">
+          <datalist id="resetPassEmailList">
+            ${users.filter(u=>u.role!=='Desarrollador' && u.email).map(u=>`<option value="${escapeAttr(u.email)}">${escapeAttr(u.name)} · ${escapeAttr(u.role)}</option>`).join('')}
+          </datalist>
         </div>
         <div class="field"><label>Contraseña nueva</label>
           <input id="resetPassNew" type="text" placeholder="Mínimo 8 caracteres" autocomplete="off">
